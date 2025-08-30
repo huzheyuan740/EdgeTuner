@@ -14,6 +14,7 @@ import random
 from torch.utils.data import DataLoader, RandomSampler
 import re
 import h5py
+from opt_pred_model_encoder import PredictNetwork
 
 torch.set_printoptions(threshold=100000)
 torch.set_printoptions(precision=3)
@@ -43,16 +44,11 @@ from datetime import datetime
 
 from torchviz import make_dot
 
-# 获取当前脚本的目录，然后向上移动两级到edge_lore目录
-# print("sys.path:", sys.path)
-current_dir = os.path.dirname(os.path.abspath(__file__))
-# print("current_dir:", current_dir)
-project_root = os.path.dirname(os.path.dirname(os.path.dirname(current_dir)))
-# print("project_root:", project_root)
-sys.path.append(project_root)
-# print("sys.path.new:", sys.path)
 
-# 现在你可以导入edge_loralib中的模块了
+current_dir = os.path.dirname(os.path.abspath(__file__))
+project_root = os.path.dirname(os.path.dirname(os.path.dirname(current_dir)))
+sys.path.append(project_root)
+
 import edge_loralib as lora
 
 parser = argparse.ArgumentParser(description='PyTorch GPT2 ft script')
@@ -81,7 +77,7 @@ parser.add_argument('--init_checkpoint', default=None, help='pretrained checkpoi
 
 parser.add_argument('--fp16', action='store_true', help='train model with fp16')
 
-parser.add_argument('--log_interval', type=int, default=5, help='log interval')
+parser.add_argument('--log_interval', type=int, default=100, help='log interval')
 
 parser.add_argument('--eval_interval', type=int, default=20000, help='eval interval')
 
@@ -145,15 +141,7 @@ class AverageMeter(object):
 
 def compute_s(s_base, alpha, gamma_list, rho, N_pruned_lm, beta, is_init=False, s_comp=None, k_idx=None, layer_idx=None):
     """
-    实现给定公式的计算
-    :param lh_base: s_base^{l,h}，公式中的基础值，torch.Tensor类型
-    :param alpha: 公式中的alpha系数
-    :param gamma_list: 公式中 \sum_{j \in \mathcal{M}} \gamma_{ij} 里的 \gamma_{ij} 列表，torch.Tensor类型
-    :param rho: 公式中的rho指数
-    :param N_pruned_lm: N_pruned^{l,m}，公式中的剪枝数量，torch.Tensor类型
-    :param beta: 公式中的beta系数
-    :param H_m: H_m，公式中的分母值
-    :return: 按照公式计算得到的结果，torch.Tensor类型
+    Eqs.(29) 
     """
     
     part1 = alpha * s_base
@@ -164,19 +152,15 @@ def compute_s(s_base, alpha, gamma_list, rho, N_pruned_lm, beta, is_init=False, 
     if is_init:
         assert s_comp is None
         N_pruned_lm = np.zeros_like(np.array(N_pruned_lm))
-        # print("N_pruned_lm:", N_pruned_lm)
         for gamma_item, N_pruned_item in zip(gamma_list, N_pruned_lm):
             gamma_m_ratio[:, :, begin_gamma_item:begin_gamma_item+gamma_item] = gamma_item / sum(gamma_list)
             pruned_head_m_ratio[:, :, begin_gamma_item:begin_gamma_item+gamma_item] = N_pruned_item / gamma_item
-            # print(f"N_pruned_item:{N_pruned_item}, gamma_item:{gamma_item}, ratio:{N_pruned_item / gamma_item}")
             begin_gamma_item += gamma_item
     else:
         assert s_comp is not None
-        # print("N_pruned_lm_each:", N_pruned_lm)
         for gamma_item, N_pruned_item in zip(gamma_list, N_pruned_lm):
             gamma_m_ratio[k_idx, layer_idx, begin_gamma_item:begin_gamma_item+gamma_item] = gamma_item / sum(gamma_list)
             pruned_head_m_ratio[k_idx, layer_idx, begin_gamma_item:begin_gamma_item+gamma_item] = N_pruned_item / gamma_item
-            # print(f"N_pruned_item:{N_pruned_item}, gamma_item:{gamma_item}, ratio:{N_pruned_item / gamma_item}")
             begin_gamma_item += gamma_item
     
     part2 = gamma_m_ratio ** rho
@@ -201,8 +185,6 @@ def Pruning_baseline(s_base, config_optimize_tool, kill_rate=None):
     decision_matrix = torch.ones_like(s_base_clone)
     s_base_sum_origin = torch.sum(s_base_clone)
     head_alloc_device = config_optimize_tool['head_alloc_device']
-    # print("config_optimize_tool['tau']:", config_optimize_tool['tau'])
-    print("kill_rate:", kill_rate)
     if kill_rate is None:
         head_reserve_device = [round(item * (config_optimize_tool['tau'])) for item in head_alloc_device]
     else:
@@ -211,22 +193,17 @@ def Pruning_baseline(s_base, config_optimize_tool, kill_rate=None):
     for k_idx in range(k_size):
         for layer_idx in range(layer_size):
             s_base_tensor_list = s_base_clone[k_idx, layer_idx]
-            # print("s_base_tensor_list:", s_base_tensor_list)
-            # print("head_reserve_device:", head_reserve_device)
             start_idx = 0
             for head_alloc_item, head_reserve_item in zip(head_alloc_device, head_reserve_device):
                 sliced_s_base_tensor_list = s_base_tensor_list[start_idx:start_idx+head_alloc_item]
                 top_k_list, relative_top_k_idx = torch.topk(sliced_s_base_tensor_list, k=head_reserve_item)
                 top_k_idx = relative_top_k_idx + start_idx
-                decision_matrix[k_idx, layer_idx, top_k_idx] = 0  # 等于0表示保留当前head
+                decision_matrix[k_idx, layer_idx, top_k_idx] = 0  # keep current head
                 start_idx = start_idx+head_alloc_item
-            # print("decision_matrix:", decision_matrix[k_idx, layer_idx, :])
     
-    # print("decision_baseline:\n", decision_matrix)
     decision_matrix_sum = torch.sum(decision_matrix)
     decision_matrix_all = torch.sum(torch.ones_like(decision_matrix))
-    s_base_clone[decision_matrix==1] = 0  # 把哪些等于1需要干掉的head对应的值设为0
-    # print("s_base_clone:", s_base_clone)
+    s_base_clone[decision_matrix==1] = 0
     s_base_sum = torch.sum(s_base_clone)
     print(f"decision_baseline_sum:{decision_matrix_sum}, decision_baseline_all:{decision_matrix_all}， kill_rate_baseline:{decision_matrix_sum / decision_matrix_all}")
     print(f"s_base_baseline:{s_base_sum}, s_base_baseline_origin:{s_base_sum_origin}， importance_reserve_rate_baseline:{s_base_sum / s_base_sum_origin}")
@@ -240,9 +217,6 @@ def Greedy_Pruning(s_base, s_comp, config_optimize_tool):
     head_alloc_device = config_optimize_tool['head_alloc_device']
     s_base_sum = torch.sum(s_base_clone, dim=-1)
     s_base_sum_origin = torch.sum(s_base_clone)
-    # print("s_base:\n", s_base)
-    # print("s_base_sum:\n", s_base_sum)
-    # print("s_comp:\n", s_comp)
     tau = config_optimize_tool['tau']
     alpha = config_optimize_tool['alpha']
     rho = config_optimize_tool['rho']
@@ -252,16 +226,11 @@ def Greedy_Pruning(s_base, s_comp, config_optimize_tool):
     k_size, layer_size, _ = s_comp.shape
     for k_idx in range(k_size):
         for layer_idx in range(layer_size):
-            # print("================layer_idx:==============", layer_idx)
             N_pruned_lm = np.zeros_like(np.array(head_alloc_device))
             while s_base_sum[k_idx, layer_idx] > tau_tensor[k_idx, layer_idx]:
                 layer_item_clone = s_comp[k_idx, layer_idx]
                 min_s_comp = torch.min(layer_item_clone)
                 min_s_comp_idx = torch.argmin(layer_item_clone)
-                # print("vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv")
-                # print("layer_item_clone:", layer_item_clone)
-                # print("min_s_comp:", min_s_comp)
-                # print("min_s_comp_idx:", min_s_comp_idx)
                 decision_matrix[k_idx, layer_idx, min_s_comp_idx] = 1
                 device_idx = find_device_index(head_alloc_device, min_s_comp_idx)
                 N_pruned_lm[device_idx] += 1
@@ -277,12 +246,7 @@ def Greedy_Pruning(s_base, s_comp, config_optimize_tool):
                     layer_idx=layer_idx
                     )
                 s_comp[decision_matrix == 1] = float('inf')
-                
-                # TODO 列举一下tau和哪些因素有关，显示预测梯度了，那训练集到底是以初始为准还是以训练稳定为准？
                 s_base_sum[k_idx, layer_idx] -= s_base_clone[k_idx, layer_idx, min_s_comp_idx]
-                # print("s_base_sum:", s_base_sum)
-    # print("s_comp:\n", s_comp)
-    # print("decision_matrix:\n", decision_matrix)
     decision_matrix_sum = torch.sum(decision_matrix)
     decision_matrix_all = torch.sum(torch.ones_like(decision_matrix))
     s_base_clone[decision_matrix==1] = 0
@@ -296,22 +260,13 @@ def Greedy_Pruning(s_base, s_comp, config_optimize_tool):
 
 def save_data_to_hdf5(data):
     """
-    将生成的数据保存到HDF5文件中
-    :param data: 生成的数据字典
-    :param file_path: HDF5文件路径
+    save the generated data as HDF5 files
     """
-    file_path = os.path.join(data['dataset_path'], 'lora_dataset_batch_4_model_618_test.h5')
-    # if os.path.exists(file_path):
-    #     os.remove(file_path)
+    file_path = os.path.join(data['dataset_path'], 'lora_dataset_batch_4_model.h5')
     if dist.get_rank() == 1 and config.optimize_tool['is_include_input_x']:
         stacked_input_x = torch.stack(data['input_x'], dim=0)
-    # print("stacked_input_x:", stacked_input_x.shape)
-    # print("data['base_parm']:", data['base_parm'].shape)
-    # print("data['lora_parm']:", data['lora_parm'].shape)
-    # print("data['lora_grad']:", data['lora_grad'].shape)
-    # print("data['matrix']:", data['matrix'].shape)
     with h5py.File(file_path, 'a') as f:
-        # 初始化数据集（如果不存在）
+        # init dataset
         if 'matrix' not in f:
             if config.optimize_tool['is_include_input_x']:
                 input_x_dset = f.create_dataset('input_x', shape=(0,)+tuple(stacked_input_x.shape), maxshape=(None,)+tuple(stacked_input_x.shape), dtype='f4')
@@ -329,7 +284,7 @@ def save_data_to_hdf5(data):
             matrix_dset = f['matrix']
             epoch_dset = f['epoch']
 
-        # 扩展数据集
+        # add dataset
         index = len(matrix_dset)
         if config.optimize_tool['is_include_input_x']:
             input_x_dset.resize(index + 1, axis=0)
@@ -339,7 +294,7 @@ def save_data_to_hdf5(data):
         matrix_dset.resize(index + 1, axis=0)
         epoch_dset.resize(index + 1, axis=0)
 
-        # 保存数据
+        # save dataset
         if config.optimize_tool['is_include_input_x']:
             input_x_dset[index] = stacked_input_x.cpu().detach().numpy()
         base_parm_dset[index] = data['base_parm'].detach().cpu().numpy()
@@ -347,12 +302,10 @@ def save_data_to_hdf5(data):
         lora_grad_dset[index] = data['lora_grad'].detach().cpu().numpy()
         matrix_dset[index] = data['matrix'].detach().cpu().numpy()
         epoch_dset[index] = data['epoch']
-        print("matrix_dset:", matrix_dset.shape)
 
 
 def post_cal_Frobenius_matrix(matrix):
     matrix = torch.sqrt(matrix) / 3
-    # print("Frobenius_matrix:", Frobenius_matrix)
     min_val = torch.min(matrix)
     max_val = torch.max(matrix)
     if max_val == min_val:
@@ -372,7 +325,7 @@ def update_model_by_optimizer(_optimizer, _model, _schedule, args, is_update=Tru
                 torch.nn.utils.clip_grad_norm_(_model.parameters(), args.clip)
 
         _optimizer.step()
-        _optimizer.zero_grad()  # TODO Order maters? or need it?
+        _optimizer.zero_grad()
 
 
 def update_model_by_optimizer_collect_data(_optimizer, _model, _schedule, args, is_update=True):
@@ -385,10 +338,9 @@ def update_model_by_optimizer_collect_data(_optimizer, _model, _schedule, args, 
 
         _optimizer.step()
 
-        if config.optimize_tool['is_pred_net_data_collect'] and dist.get_rank() > 0:  # 需要根据实际指定 目前默认为rank为1的设备
+        if config.optimize_tool['is_pred_net_data_collect'] and dist.get_rank() > 0:  # default rank1
             k_steps_idx = config.statistical_dict['idx']
-            # 开始统计初始训练重要度
-            # model_config = _model.module.transformer.config  # TODO 分布式情况_model.module可能要修改
+            # get Head Importance
             n_layer = config.n_layer
             n_head = config.n_head
             Frobenius_matrix = torch.zeros((n_layer, n_head), dtype=torch.float, device=args.device)
@@ -402,12 +354,10 @@ def update_model_by_optimizer_collect_data(_optimizer, _model, _schedule, args, 
                     layer_idx = int(numbers[0])
                     head_idx = int(numbers[1])
                     abs_head_idx = start_head + head_idx
-                    # print(f"rank:{dist.get_rank()}, name:{n}, parm:{p.size()}, grad?:{p.requires_grad}")  # p.grad.shape
                     Frobenius_matrix[layer_idx, abs_head_idx] += torch.sum(p.grad ** 2)  # Lora A + Lora B
                     if k_steps_idx % config.optimize_tool['history_k_steps'] == (config.optimize_tool['history_k_steps'] - 1):
                         Frobenius_matrix_lora_parm[layer_idx, abs_head_idx] += torch.sum(p ** 2)  # Lora A + Lora B
                 elif 'lora_' not in n and 'c_attn.weight' in n:
-                    # print(f"name:{n}, parm:{p.size()}")
                     numbers = re.findall(r'\d+', n)
                     layer_idx = int(numbers[0])
                     if k_steps_idx == 0:
@@ -428,18 +378,8 @@ def update_model_by_optimizer_collect_data(_optimizer, _model, _schedule, args, 
             if k_steps_idx % config.optimize_tool['history_k_steps'] == (config.optimize_tool['history_k_steps'] - 1):
                 Frobenius_matrix_lora_parm_normalized = post_cal_Frobenius_matrix(Frobenius_matrix_lora_parm)
                 config.optimize_tool['lora_parm'] = Frobenius_matrix_lora_parm_normalized
-                # print("self.config.optimize_tool['input_x']:", config.optimize_tool['input_x'][0].shape)
                 
                 k_steps_matrix = config.optimize_tool['matrix']
-                # min_val = torch.min(k_steps_matrix)
-                # max_val = torch.max(k_steps_matrix)
-                # if max_val == min_val:
-                #     normalized_tensor = torch.zeros_like(k_steps_matrix)
-                # else:
-                #     normalized_tensor = (k_steps_matrix - min_val) / (max_val - min_val)
-                # config.optimize_tool['matrix'] = normalized_tensor
-                # print("k_steps_idx:", k_steps_idx)
-                # print("config.optimize_tool['matrix']:", config.optimize_tool['matrix'])
                 lambda_k = config.optimize_tool['lambda']
                 for each_k_idx in range(k_steps_matrix.shape[0]):
                     if each_k_idx > 0:
@@ -452,7 +392,7 @@ def update_model_by_optimizer_collect_data(_optimizer, _model, _schedule, args, 
                     dist.send(config.optimize_tool['matrix'], dst=1)
 
                 
-                if dist.get_rank() == 1:   # 需要根据实际指定 目前默认为rank为1的设备
+                if dist.get_rank() == 1:
                     for rand_idx in [2, 3]:
                         lora_parm = torch.empty_like(config.optimize_tool['lora_parm'])
                         dist.recv(lora_parm, src=rand_idx)
@@ -465,14 +405,12 @@ def update_model_by_optimizer_collect_data(_optimizer, _model, _schedule, args, 
                         matrix = torch.empty_like(config.optimize_tool['matrix'])
                         dist.recv(matrix, src=rand_idx)
                         config.optimize_tool['matrix'] += matrix
-                        # print("recv:", rand_idx)
                         
-                    # print(f"rank:{dist.get_rank()}, matrix\n:{config.optimize_tool['matrix'][-1]}")
                     save_data_to_hdf5(config.optimize_tool)
                 config.optimize_tool['input_x'].clear()
                 return config.optimize_tool['matrix']
 
-        _optimizer.zero_grad()  # TODO Order maters? or need it?
+        _optimizer.zero_grad()
 
 
 def update_model_by_optimizer_collect_data_parallel(_optimizer, _model, _schedule, args, is_update=True):
@@ -485,10 +423,9 @@ def update_model_by_optimizer_collect_data_parallel(_optimizer, _model, _schedul
 
         _optimizer.step()
 
-        if config.optimize_tool['is_pred_net_data_collect'] and dist.get_rank() > 0:  # 需要根据实际指定 目前默认为rank为1的设备
+        if config.optimize_tool['is_pred_net_data_collect'] and dist.get_rank() > 0:
             k_steps_idx = config.statistical_dict['idx']
-            # 开始统计初始训练重要度
-            # model_config = _model.module.transformer.config  # TODO 分布式情况_model.module可能要修改 
+            # get Head Importance
             n_layer = config.n_layer
             n_head = config.n_head
             each_head_n_embd = config.n_embd // config.n_head
@@ -521,7 +458,6 @@ def update_model_by_optimizer_collect_data_parallel(_optimizer, _model, _schedul
                         if k_steps_idx % config.optimize_tool['history_k_steps'] == (config.optimize_tool['history_k_steps'] - 1):
                             Frobenius_matrix_lora_parm[layer_idx, abs_head_idx] += torch.sum(p_split_head ** 2)  # Lora A + Lora B
                     elif 'lora_' not in n and 'c_attn.weight' in n:
-                        # print(f"name:{n}, parm:{p.size()}")
                         if k_steps_idx == 0:
                             numbers = re.findall(r'\d+', n)
                             layer_idx = int(numbers[0])
@@ -542,18 +478,8 @@ def update_model_by_optimizer_collect_data_parallel(_optimizer, _model, _schedul
             if k_steps_idx % config.optimize_tool['history_k_steps'] == (config.optimize_tool['history_k_steps'] - 1):
                 Frobenius_matrix_lora_parm_normalized = post_cal_Frobenius_matrix(Frobenius_matrix_lora_parm)
                 config.optimize_tool['lora_parm'] = Frobenius_matrix_lora_parm_normalized
-                # print("self.config.optimize_tool['input_x']:", config.optimize_tool['input_x'][0].shape)
                 
                 k_steps_matrix = config.optimize_tool['matrix']
-                # min_val = torch.min(k_steps_matrix)
-                # max_val = torch.max(k_steps_matrix)
-                # if max_val == min_val:
-                #     normalized_tensor = torch.zeros_like(k_steps_matrix)
-                # else:
-                #     normalized_tensor = (k_steps_matrix - min_val) / (max_val - min_val)
-                # config.optimize_tool['matrix'] = normalized_tensor
-                # print("k_steps_idx:", k_steps_idx)
-                # print("config.optimize_tool['matrix']:", config.optimize_tool['matrix'])
                 lambda_k = config.optimize_tool['lambda']
                 for each_k_idx in range(k_steps_matrix.shape[0]):
                     if each_k_idx > 0:
@@ -566,7 +492,7 @@ def update_model_by_optimizer_collect_data_parallel(_optimizer, _model, _schedul
                     dist.send(config.optimize_tool['matrix'], dst=1)
 
                 
-                if dist.get_rank() == 1:   # 需要根据实际指定 目前默认为rank为1的设备
+                if dist.get_rank() == 1:
                     for rand_idx in [2, 3]:
                         lora_parm = torch.empty_like(config.optimize_tool['lora_parm'])
                         dist.recv(lora_parm, src=rand_idx)
@@ -579,34 +505,24 @@ def update_model_by_optimizer_collect_data_parallel(_optimizer, _model, _schedul
                         matrix = torch.empty_like(config.optimize_tool['matrix'])
                         dist.recv(matrix, src=rand_idx)
                         config.optimize_tool['matrix'] += matrix
-                        # print("recv:", rand_idx)
-                        
-                    # print(f"rank:{dist.get_rank()}, matrix\n:{config.optimize_tool['matrix'][-1]}")
                     save_data_to_hdf5(config.optimize_tool)
                 config.optimize_tool['input_x'].clear()
                 return config.optimize_tool['matrix']
 
-        _optimizer.zero_grad()  # TODO Order maters? or need it?
+        _optimizer.zero_grad()
 
 def optimizer_step(_loss, _optimizer, _model, _schedule, args, lora_info, is_update=True):
     if args.fp16:
         with amp.scale_loss(_loss, _optimizer) as _scaled_loss:
             _scaled_loss.backward()
     else:
-        # params_before = {name: param.clone() for name, param in _model.named_parameters()}
-        # grads_before_update = {name: param.grad.clone() if param.grad is not None else None for name, param in
-        #                        _model.named_parameters()}
-        if dist.get_rank() == 1:  # 需要根据实际指定 目前默认为rank为1的设备
+        if dist.get_rank() == 1: 
             _loss.backward()
             first_hidden_states = lora_info[f'first_hidden_states_{dist.get_rank()}']
 
-        # tensor_to_lora_list = lora_info[f"tensor_to_lora_list_{dist.get_rank()}"]
         combined_attn_temp_list = lora_info[f'combined_attn_temp_list_{dist.get_rank()}']
 
         for block_idx in reversed(range(len(combined_attn_temp_list))):
-            
-            # if isinstance(combined_attn_temp_list[block_idx], (int, float)) and math.isinf(combined_attn_temp_list[block_idx]):
-            #     continue
             mask = config.optimize_tool['cur_step_decision_matrix'][block_idx].to(torch.bool)
             negative_mask = ~mask
             head_device_idx_list = config.optimize_tool['head_device_idx_list']
@@ -619,10 +535,7 @@ def optimizer_step(_loss, _optimizer, _model, _schedule, args, lora_info, is_upd
                                                             torch.device('cuda', int(os.environ['LOCAL_RANK'])), src=0,
                                                             is_cal_criterion=config.optimize_tool['is_statistical_dict'], statistical_dict=config.statistical_dict,
                                                             is_belong_block=True, is_backward=True)
-                # print(f"==recv device:{dist.get_rank()}, grad:{combined_attn_temp_grad.shape}") # combined_attn_temp_grad.shape
                 combined_attn_temp_list[block_idx].backward(combined_attn_temp_grad)
-            # print(f"rank:{dist.get_rank()}, tensor_to_lora_list:{tensor_to_lora_list[0].grad}")
-            # print("-"*50, block_idx, dist.get_rank())
         
         if dist.get_rank() == 1:
             first_hidden_states_grad, _ = dist_recv_grad(first_hidden_states.shape, torch.device('cuda', int(os.environ['LOCAL_RANK'])),
@@ -630,7 +543,6 @@ def optimizer_step(_loss, _optimizer, _model, _schedule, args, lora_info, is_upd
             
             first_hidden_states.backward(first_hidden_states_grad)
         if config.optimize_tool['is_pred_net_data_collect']:
-            # return update_model_by_optimizer_collect_data(_optimizer, _model, _schedule, args, is_update)
             return update_model_by_optimizer_collect_data_parallel(_optimizer, _model, _schedule, args, is_update)
         else:
             update_model_by_optimizer(_optimizer, _model, _schedule, args, is_update)
@@ -655,16 +567,10 @@ def clear_all_grad(base_info):
 
 def base_optimizer_step(_optimizer, _model, _schedule, args, base_info, is_update=True):
     final_hidden_states = base_info['base_final_hidden_states']
-    # base_hidden_states_to_lora_list = base_info['base_hidden_states_to_lora_list']
     final_hidden_states_grad, _ = dist_recv_grad(final_hidden_states.shape, torch.device('cuda', int(os.environ['LOCAL_RANK'])),
                                                  src=1)
 
     final_hidden_states.backward(final_hidden_states_grad)
-
-    # combined_attn_temp_list = base_info['base_combined_attn_temp_list']
-    # for block_idx in reversed(range(len(combined_attn_temp_list))):
-    #     print(f"combined_attn_temp_list:{len(combined_attn_temp_list[block_idx])}, grad?:{combined_attn_temp_list[block_idx].grad.shape}", )
-
 
 def evaluate(model, valid_loader, args):
     model.eval()
@@ -681,17 +587,15 @@ def evaluate(model, valid_loader, args):
             _target = data['target'].to(args.device)
             _msk = data['mask'].to(args.device)
 
-            # _lm_logits, _loss = model(_input, lm_labels=_target, lm_mask=_msk)
             if dist.get_rank() > 0:
                 _lm_logits, _loss, lora_info = model(
-                    _input, lm_labels=_target, lm_mask=_msk,  # label_smooth=args.label_smooth
+                    _input, lm_labels=_target, lm_mask=_msk,
                 )
-                # _lm_loss = _lm_loss.mean()
             else:
                 lm_logits, presents, base_info = model(
-                    data['input'].size(), lm_labels=args.device, lm_mask=None,  # label_smooth=args.label_smooth
+                    data['input'].size(), lm_labels=args.device, lm_mask=None,
                 )
-            if dist.get_rank() == 1:  # 需要根据实际指定 目前默认为rank为1的设备
+            if dist.get_rank() == 1:
                 loss = _loss.mean()
 
                 avg_lm_loss.update(loss.item())
@@ -702,6 +606,19 @@ def evaluate(model, valid_loader, args):
         total_time = time.time() - start_time
         print('average loss', avg_lm_loss.avg)
     return avg_lm_loss.avg, math.exp(avg_lm_loss.avg)
+
+def load_model(model_path, k, m_size, seq_length, embedding_dim, layer_num, head_num):
+    model = PredictNetwork(k, m_size, seq_length, embedding_dim, layer_num, head_num)
+    checkpoint = torch.load(model_path)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    
+    epoch = checkpoint['epoch']
+    loss = checkpoint['loss']
+    
+    return model, optimizer, epoch, loss
 
 
 def train_validate(
@@ -719,19 +636,6 @@ def train_validate(
     print('start to train the model................', epoch)
     log_start_time = time.time()
     best_val_ppl = None
-
-    # train_loader.sampler.set_epoch(epoch)
-
-    print("train_loader:", len(train_loader))
-    # data = None
-    # for batch in train_loader:
-    #     data = batch
-    #
-    # if data is not None:
-    #     data = {key: value for key, value in data.items()}
-    #
-    #     print("最后一组数据:", data['input'].shape)
-    # exit()
 
     for idx, data in enumerate(train_loader):
         if dist.get_rank() > 0:
@@ -752,21 +656,17 @@ def train_validate(
                 config.statistical_dict['transmit_datasize_logic'] = None
 
             _input = data['input'].to(
-                args.device)  # 注 torch.Size([4, 512])  ,including one whole line in train.jsonl(context and completion)
-            _target = data['target'].to(args.device)  # 注 torch.Size([4, 512]) ,same as _input but no begin_token 3673
+                args.device)  
+            _target = data['target'].to(args.device)  
             _msk = data['mask'].to(
-                args.device)  # 注 torch.Size([4, 512]) ,mask 1 begin form _target's completion , else 0
+                args.device)
 
         if dist.get_rank() > 0:
-            # print(f"_input:{_input[1, :]}")
-            # print(f"rank:{dist.get_rank()}_target:{_target[1, :]}")
             _lm_logits, _lm_loss, lora_info = model(
                 _input, lm_labels=_target, lm_mask=_msk, label_smooth=args.label_smooth
             )
-            if dist.get_rank() == 1: # 需要根据实际指定 目前默认为rank为1的设备
+            if dist.get_rank() == 1:
                 _lm_loss = _lm_loss.mean()
-            # print(f"_lm_logits:{_lm_logits[1, :]}")
-            # print(f"rank:{dist.get_rank()}_lm_loss:{_lm_loss}")
         else:
             lm_logits, presents, base_info = model(
                 data['input'].size(), lm_labels=args.device, lm_mask=None, label_smooth=args.label_smooth
@@ -775,11 +675,10 @@ def train_validate(
         train_step += 1
         is_update = True if train_step % args.grad_acc == 0 else False
         if dist.get_rank() > 0:
-            if dist.get_rank() == 1:  # 需要根据实际指定 目前默认为rank为1的设备
+            if dist.get_rank() == 1:
                 avg_lm_loss.update(_lm_loss.item())
             else:
                 _lm_loss = 0
-            # print(f"rank:{dist.get_rank()}, _lm_loss:{_lm_loss}")
             k_steps_matrix = optimizer_step(
                 _lm_loss / (args.grad_acc), optimizer, model, scheduler, args, lora_info, is_update=is_update,
             )
@@ -796,14 +695,12 @@ def train_validate(
                     is_init=True
                     )
                 config.optimize_tool['decision_matrix'], kill_rate = Greedy_Pruning(k_steps_matrix, k_steps_matrix_comp_init, config.optimize_tool)
-                # decision_matrix_baseline = Pruning_baseline(k_steps_matrix, config.optimize_tool, kill_rate)
         elif dist.get_rank() == 0:
             base_optimizer_step(
                 optimizer, model, scheduler, args, base_info,
                 is_update=is_update,
             )
 
-        # args.log_interval = 1
         if train_step % args.log_interval == 0:
             elapsed = time.time() - log_start_time
             lr = optimizer.param_groups[0]['lr']
@@ -812,15 +709,11 @@ def train_validate(
                       f'loss {avg_lm_loss.val:5.2f} | avg loss {avg_lm_loss.avg:5.2f} | ' \
                       f'ppl {math.exp(avg_lm_loss.avg):5.2f}'
 
-            if dist.get_rank() == 1:  # 需要根据实际指定 目前默认为rank为1的设备
+            if dist.get_rank() == 1:
                 print(log_str)
             log_start_time = time.time()
             avg_lm_loss.reset()
 
-        # print(f"rank:{dist.get_rank()}, args.save_interval:{args.save_interval}")
-        # if dist.get_rank() == 0:
-        #     for n, p in model.named_parameters():
-        #         print(f"name:{n}, parm:{p.size()}, grad?:{p.requires_grad}, rank:{dist.get_rank()}")
         if train_step % args.save_interval == 0:
             if dist.get_rank() > 0:
                 model_path = os.path.join(args.work_dir, f'model.{train_step}_lora_{dist.get_rank()}.pt')
@@ -855,8 +748,6 @@ def train_validate(
 
         if train_step == args.max_step:
             break
-        # if idx == 100:
-        #     exit()
 
     if dist.get_rank() > 0:
         model_path = os.path.join(args.work_dir, f'model.{train_step}.pt')
@@ -873,7 +764,6 @@ if __name__ == '__main__':
     # ref_event = torch.cuda.Event(enable_timing=True)
     # ref_event.record()
     ref_event = time.time()
-    print("args.fp16:", args.fp16)
 
     if args.fp16:
         try:
@@ -896,24 +786,6 @@ if __name__ == '__main__':
         args.valid_data, args.valid_batch_size, args.seq_len,
     )
 
-    # train_loader = DataLoader(
-    #     train_data, batch_size=args.train_batch_size, num_workers=0,
-    #     shuffle=False, pin_memory=False, drop_last=True,
-    #     sampler=torch.utils.data.distributed.DistributedSampler(train_data, seed=args.random_seed)
-    # )
-    #
-    # valid_loader = DataLoader(
-    #     valid_data, batch_size=args.valid_batch_size, num_workers=0,
-    #     shuffle=False, pin_memory=False, drop_last=False,
-    #     sampler=torch.utils.data.distributed.DistributedSampler(valid_data, seed=args.random_seed)
-    # )
-
-    # print("train_data_len:", train_data.num_batches)
-    # k = 420  # 假设要选取前 10 个数据
-    # selected_data = []
-    # for i in range(min(k, len(train_data))):
-    #     selected_data.append(train_data[i])
-    # train_data = selected_data
     train_loader = DataLoader(
         train_data, batch_size=args.train_batch_size, num_workers=0,
         shuffle=False, pin_memory=False, drop_last=True,
@@ -958,18 +830,16 @@ if __name__ == '__main__':
             statistical_dict={}
         )
 
-    # optimize_matrix = np.ones((config.n_layer, config.n_head))
     cur_optimize_matrix = torch.randint(0, 2, size=(config.n_layer, config.n_head))
-    # print("cur_optimize_matrix:", cur_optimize_matrix)
     cur_optimize_matrix = torch.zeros_like(cur_optimize_matrix)
-    config.optimize_tool['is_statistical_dict'] = False  #  是否进行预实验的统计，默认关闭
-    config.optimize_tool['is_pred_net_data_collect'] = False  #  是否进行预测网络数据集收集，默认关闭
-    config.optimize_tool['is_include_input_x'] = False  #  是否进行保存网络输入embedding，默认关闭
-    config.optimize_tool['is_cal_s_comp'] = False  #  是否s_comp公式的计算以及剪枝，默认关闭
-    # cur_optimize_matrix[0:int(config.n_layer*1/3),:] = 1
-    config.optimize_tool['cur_step_decision_matrix'] = cur_optimize_matrix  # 最终优化得到的决策矩阵
+    config.optimize_tool['is_statistical_dict'] = False
+    config.optimize_tool['is_pred_net_data_collect'] = False
+    config.optimize_tool['is_include_input_x'] = False 
+    config.optimize_tool['is_cal_s_comp'] = False
+    config.optimize_tool['cur_step_decision_matrix'] = cur_optimize_matrix
+    
     config.optimize_tool['vector'] = None
-    config.optimize_tool['head_alloc_device'] = [8,5,3]  # 每个设备静态的分几个head 预先设置 [9,4,3] [11,5] [16] / [6,5,5] [8,8] / [8,5,3] [10,6,4]
+    config.optimize_tool['head_alloc_device'] = [8,5,3]  # head alloction for each device in Eqs.(3)
     head_device_idx_list = [0] * (len(config.optimize_tool['head_alloc_device'])+1)
     start_head = 0
     for device_idx, device_num in enumerate(config.optimize_tool['head_alloc_device']):
@@ -980,26 +850,33 @@ if __name__ == '__main__':
     
 
     config.optimize_tool['hidden_state_shape'] = torch.Size((args.train_batch_size, args.seq_len, config.n_embd))
-    print("config.optimize_tool['hidden_state_shape']:", config.optimize_tool['hidden_state_shape'])  
     config.optimize_tool['history_k_steps'] = 10
-    config.optimize_tool['lambda'] = 0.8  # np.arange(0.05, 1, 0.05)
+    config.optimize_tool['lambda'] = 0.8 
     config.optimize_tool['alpha'] = 1
     config.optimize_tool['rho'] = 0.2
     config.optimize_tool['beta'] = 0.3
-    config.optimize_tool['tau'] = 0.7  # 当前的含义是保留多少%的分数
-    config.optimize_tool['eta'] = 0.8  # 跳层的阈值参数 0.4
+    config.optimize_tool['tau'] = 0.7  # keep X% head importance
+    config.optimize_tool['eta'] = 0.4  # Layer-Wise Pruning
     config.optimize_tool['head_pruned_device'] = config.optimize_tool['head_alloc_device'] * 0# [round(item * config.optimize_tool['beta']) for item in config.optimize_tool['head_alloc_device']]
     optimize_matrix = torch.zeros((config.optimize_tool['history_k_steps'], config.n_layer, config.n_head), dtype=torch.float, device=args.device)
-    config.optimize_tool['matrix'] = optimize_matrix  # 分数矩阵
-    config.optimize_tool['decision_matrix'] = torch.zeros_like(optimize_matrix)  # 最终优化得到的决策矩阵
+    config.optimize_tool['matrix'] = optimize_matrix 
+    config.optimize_tool['decision_matrix'] = torch.zeros_like(optimize_matrix)
 
-    # 以下是组成预测网络数据集的相关训练数据
+    # part of input of iHeadPruner
     config.optimize_tool['input_x'] = []
     config.optimize_tool['base_parm'] = None
     config.optimize_tool['lora_parm'] = None
     config.optimize_tool['lora_grad'] = torch.zeros_like(optimize_matrix)
     config.optimize_tool['epoch'] = None
     config.optimize_tool['dataset_path'] = './custom_data'
+    
+    # Load iHeadPruner model
+    pruner_model, _ = load_model(config.optimize_tool['dataset_path'], 
+                                                   config.optimize_tool['history_k_steps'], 
+                                                   args.train_batch_size, args.seq_len, config.n_embd, 
+                                                   config.n_layer, config.n_head)
+    
+
     vis_save_path = None
     if dist.get_rank() > 0:
         current_time = datetime.now().strftime("%Y%m%d%H%M%S")
@@ -1009,26 +886,19 @@ if __name__ == '__main__':
         print(f'loading model pretrained weight.rank:{args.dist.get_rank()}')
         lm_net.load_weight(torch.load(args.init_checkpoint))
 
-    # lm_net = lm_net.cuda()
     lm_net = lm_net.to(args.local_rank)
-
-    # for n, p in lm_net.named_parameters():
-    #     print(f"name:{n}, parm:{p.size()}")
+    
     if args.lora_dim > 0:
         lora.mark_only_lora_as_trainable(lm_net)
     optimizer = create_adam_optimizer_from_args(lm_net, args)
 
     if args.max_step is None:
-        # args.max_step = (args.max_epoch * train_data.num_batches + args.world_size - 1) // args.world_size
         local_world_size = 1
         args.max_step = (args.max_epoch * train_data.num_batches + local_world_size - 1) // local_world_size
-        # args.max_step = (args.max_epoch * k/3 + local_world_size - 1) // local_world_size
-        print('set max_step:', args.max_step)
 
     scheduler = create_optimizer_scheduler(optimizer, args)
     if args.fp16:
         lm_net, optimizer = amp.initialize(lm_net, optimizer, opt_level="O1")
-    # lm_net, optimizer = distributed_opt(args, lm_net, optimizer, grad_acc=args.grad_acc)
 
     try:
         train_step = 0
@@ -1043,8 +913,6 @@ if __name__ == '__main__':
                 train_step=train_step, epoch=epoch
             )
             if dist.get_rank() > 0:
-                # res = config.statistical_dict['send_data_array_per_epoch_timestep_mi']
-                # print("res:", len(res))
                 if config.optimize_tool['is_statistical_dict']:
                     save_vis_file(config.statistical_dict)
                     save_vis_pic(config.statistical_dict, step_idx=config.statistical_dict['idx'])

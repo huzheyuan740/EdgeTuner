@@ -26,6 +26,6 @@ HF_ENDPOINT=https://hf-mirror.com python -m torch.distributed.launch --nproc_per
     --lora_alpha 32 \
     --lora_dropout 0.1 \
     --label_smooth 0.1 \
-    --work_dir /mnt/data/hzy_data/custom_dataset/e2e_all_trainset \
+    --work_dir ./custom_dataset/e2e_all_trainset \
     --random_seed 110 \
     --client_num 2
